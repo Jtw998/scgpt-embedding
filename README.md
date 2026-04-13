@@ -1,5 +1,5 @@
 # scGPT Embedding Engine
-> Production-grade scGPT embedding computation tool fully compatible with official pre-trained models
+> scGPT embedding computation tool fully compatible with official pre-trained models
 
 ## 📖 Overview
 A lightweight, easy-to-use tool for extracting high-quality pre-trained embeddings from single-cell RNA-seq data using the scGPT foundation model. Implements the exact preprocessing and inference logic from the official scGPT pipeline with automatic hardware acceleration.
