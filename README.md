@@ -1,57 +1,55 @@
 # scGPT Embedding Engine
-> scGPT embedding computation tool fully compatible with official pre-trained models
 
-## 📖 Overview
-A lightweight, easy-to-use tool for extracting high-quality pre-trained embeddings from single-cell RNA-seq data using the scGPT foundation model. Implements the exact preprocessing and inference logic from the official scGPT pipeline with automatic hardware acceleration.
+scGPT embedding computation tool, fully self-contained, no external dependencies beyond PyTorch and scanpy.
 
-## ✨ Key Features
-- 100% compatible with all official scGPT pre-trained models
-- Auto-detects and uses CUDA, MPS (Apple Silicon), or CPU for acceleration
-- Supports FlashAttention for 2-4x faster inference
-- Extracts 512D cell-level embeddings, gene-level embeddings, and full sequence embeddings
-- Complete built-in preprocessing pipeline aligned with scGPT pre-training
-- Both Python API and command-line interface available
-- Production-ready with robust error handling and validation
+## Scripts
 
-## 🚀 Quick Start
-### Installation
+| File | Input | Output |
+|------|-------|--------|
+| `scgpt_embedding.py` | `.h5ad` file + model dir (`args.json`, `best_model.pt`, `vocab.json`) | Cell embeddings → `h5ad.obsm["X_scGPT"]` (+ optional `.npy`) |
+| `extract_gene_embeddings.py` | Model dir + gene list file (TSV/CSV with `gene_name` column) | Gene embedding matrix `[n_genes, 512]` → `.npy` file |
+| `node_embedding.py` | `.h5ad` file + model dir | Cell embeddings + per-patient KNN graph structures |
+
+## Quick Start
+
+### Compute cell embeddings
+
 ```bash
-# Install dependencies (requires scGPT installed first)
-pip install scanpy torch numpy scipy
+python scgpt_embedding.py data.h5ad --model-dir . --batch-size 32
 ```
-Download pre-trained model files from [scGPT Model Zoo](https://github.com/bowang-lab/scGPT#pretrained-scgpt-model-zoo) (vocab.json, best_model.pt) and place them in the working directory.
 
-### Command Line
+Options:
+- `--output-npy path.npy` — save embeddings as numpy file
+- `--no-save-h5ad` — skip writing back to h5ad
+- `--fast-transformer` — enable flash-attention (requires `flash-attn`)
+
+### Extract gene embeddings by gene list
+
 ```bash
-python scgpt_embedding.py --input data.h5ad --output data_with_embeddings.h5ad
+python extract_gene_embeddings.py . gene_list.tsv gene_embeddings.npy
 ```
 
-### Python API
-```python
-import scanpy as sc
-from scgpt_embedding import scGPTEmbeddingEngine
+Gene list must be TSV/CSV with a `gene_name` column.
 
-engine = scGPTEmbeddingEngine()
-adata = sc.read("data.h5ad")
-adata = engine.compute_embeddings(adata)
+## Installation
 
-# Access embeddings: adata.obsm["X_scGPT"] (shape: n_cells × 512)
+```bash
+pip install torch scanpy numpy scipy pandas tqdm
 ```
 
-## 📝 Output
-- Cell embeddings stored in `adata.obsm["X_scGPT"]`
-- Optional gene embeddings stored in `adata.varm["scGPT_gene_emb"]`
+Download pre-trained model files from [scGPT Model Zoo](https://github.com/bowang-lab/scGPT#pretrained-scgpt-model-zoo) and place `args.json`, `best_model.pt`, `vocab.json` in the working directory.
 
-## 📄 Citation
+## Device
+
+Auto-detects: CUDA > Apple Silicon MPS > CPU.
+
+## Citation
+
 ```
 @article{cui2023scGPT,
-title={scGPT: Towards Building a Foundation Model for Single-Cell Multi-omics Using Generative AI},
-author={Cui, Haotian and Wang, Chloe and Maan, Hassaan and Pang, Kuan and Luo, Fengning and Wang, Bo},
-journal={bioRxiv},
-year={2023},
-publisher={Cold Spring Harbor Laboratory}
+  title={scGPT: Towards Building a Foundation Model for Single-Cell Multi-omics Using Generative AI},
+  author={Cui, Haotian and Wang, Chloe and Maan, Hassaan and Pang, Kuan and Luo, Fengning and Wang, Bo},
+  journal={bioRxiv},
+  year={2023}
 }
 ```
-
-## 📄 License
-MIT
