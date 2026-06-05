@@ -28,6 +28,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from torch.utils.data import DataLoader, Dataset, SequentialSampler
+from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
+from sklearn.preprocessing import LabelEncoder
 from tqdm import tqdm
 
 
@@ -196,6 +198,22 @@ class TransformerModel(nn.Module):
         return {"cell_emb": cell_emb, "sequence_output": output}
 
 
+class RNAHead(nn.Module):
+    """RNA cell embedding head: mean pool gene tokens -> Linear projection.
+
+    Takes the full sequence output from scGPT (with CLS token at position 0),
+    mean-pools all gene tokens, and projects to the desired output dimension.
+    Does NOT apply L2 normalization.
+    """
+    def __init__(self, input_dim: int = 512, output_dim: int = 512):
+        super().__init__()
+        self.proj = nn.Linear(input_dim, output_dim)
+
+    def forward(self, sequence_output: torch.Tensor) -> torch.Tensor:
+        gene_tokens = sequence_output[:, 1:, :]
+        return self.proj(gene_tokens.mean(dim=1))
+
+
 def freeze_layers(model: nn.Module, freeze_n_layers: int = 8) -> None:
     for param in model.gene_encoder.parameters():
         param.requires_grad = False
@@ -220,6 +238,32 @@ def freeze_layers(model: nn.Module, freeze_n_layers: int = 8) -> None:
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     print(f"Trainable: {trainable:,} / {total:,} ({trainable / total * 100:.1f}%)")
+
+
+def simclr_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float) -> torch.Tensor:
+    """SimCLR InfoNCE loss for two augmented views.
+
+    Args:
+        z1: (B, proj_dim) — projection of view 1
+        z2: (B, proj_dim) — projection of view 2
+        temperature: softmax temperature scaling factor
+
+    Returns:
+        Scalar cross-entropy loss treating (z1_i, z2_i) as positive pairs.
+    """
+    z1 = F.normalize(z1, dim=1)
+    z2 = F.normalize(z2, dim=1)
+    B = z1.shape[0]
+    z = torch.cat([z1, z2], dim=0)
+    sim = z @ z.T / temperature
+    sim_i_j = torch.diag(sim, B)
+    sim_j_i = torch.diag(sim, -B)
+    pos = torch.cat([sim_i_j, sim_j_i], dim=0).view(2 * B, 1)
+    mask = ~torch.eye(2 * B, device=z.device, dtype=torch.bool)
+    neg = sim[mask].view(2 * B, -1)
+    logits = torch.cat([pos, neg], dim=1)
+    labels = torch.zeros(2 * B, device=z.device, dtype=torch.long)
+    return F.cross_entropy(logits, labels)
 
 
 def load_scgpt_model(
@@ -358,8 +402,13 @@ class DataCollator:
 # Dataset
 # ============================================================================
 
-class FullGeneDataset(Dataset):
-    """Dataset that includes all vocabulary genes for each cell, preserving zero expression values."""
+class SparseGeneDataset(Dataset):
+    """Dataset that returns only non-zero genes per cell.
+
+    Much faster than random-sampling from the full vocab — most cells have
+    far fewer non-zero genes than the total vocabulary size. The collator
+    handles padding and random gene sampling for cells that exceed max_seq_len.
+    """
     def __init__(
         self,
         count_matrix: np.ndarray,
@@ -371,40 +420,42 @@ class FullGeneDataset(Dataset):
         self.count_matrix = count_matrix
         self.gene_ids = gene_ids
         self.vocab = vocab
-        self.pad_token_id = vocab["<pad>"]
         self.cls_token_id = vocab["<cls>"]
         self.pad_value = model_configs.get("pad_value", 0)
         self.max_seq_len = max_seq_len
-        self.valid_gene_mask = gene_ids >= 0
-        self.valid_gene_ids = gene_ids[self.valid_gene_mask]
-        print(f"Using {len(self.valid_gene_ids)} genes from vocabulary for embedding computation")
+        self.valid_mask = gene_ids >= 0
+        self.valid_gene_ids = gene_ids[self.valid_mask]
+        n_kept = np.sum(self.valid_mask)
+        n_dropped = len(gene_ids) - n_kept
+        if n_dropped:
+            print(f"Filtered out {n_dropped} genes not in vocabulary, keeping {n_kept}")
 
     def __len__(self) -> int:
         return len(self.count_matrix)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        full_expression = self.count_matrix[idx]
-        valid_expressions = full_expression[self.valid_gene_mask]
+        row = self.count_matrix[idx]
+        nonzero_idx = np.nonzero(row)[0]
+        nonzero_idx = nonzero_idx[self.valid_mask[nonzero_idx]]
+        genes = self.gene_ids[nonzero_idx]
+        values = row[nonzero_idx]
 
-        if len(self.valid_gene_ids) > (self.max_seq_len - 1):
-            sample_indices = np.random.choice(
-                len(self.valid_gene_ids),
-                size=self.max_seq_len - 1,
-                replace=False
-            )
-            selected_gene_ids = self.valid_gene_ids[sample_indices]
-            selected_expressions = valid_expressions[sample_indices]
-        else:
-            selected_gene_ids = self.valid_gene_ids
-            selected_expressions = valid_expressions
+        # Truncate to max_seq_len-1 if needed (collator handles the rest)
+        if len(genes) > self.max_seq_len - 1:
+            keep = np.random.choice(len(genes), self.max_seq_len - 1, replace=False)
+            genes = genes[keep]
+            values = values[keep]
 
-        genes = np.concatenate([[self.cls_token_id], selected_gene_ids])
-        expressions = np.concatenate([[self.pad_value], selected_expressions])
-
+        genes = np.insert(genes, 0, self.cls_token_id)
+        values = np.insert(values, 0, self.pad_value)
         return {
             "genes": torch.from_numpy(genes).long(),
-            "expressions": torch.from_numpy(expressions).float(),
+            "expressions": torch.from_numpy(values).float(),
         }
+
+
+# Alias kept for backwards compatibility
+FullGeneDataset = SparseGeneDataset
 
 
 # ============================================================================
@@ -460,13 +511,7 @@ def compute_full_embeddings(
         gene_ids = np.array(adata.var["id_in_vocab"])
 
     max_seq_len = model_configs.get("max_seq_len", 1200)
-    dataset = FullGeneDataset(
-        count_matrix=count_matrix,
-        gene_ids=gene_ids,
-        vocab=vocab,
-        model_configs=model_configs,
-        max_seq_len=max_seq_len
-    )
+    dataset = SparseGeneDataset(count_matrix, gene_ids, vocab, model_configs, max_seq_len)
 
     collator = DataCollator(
         do_padding=True,
@@ -475,7 +520,7 @@ def compute_full_embeddings(
         do_mlm=False,
         do_binning=True,
         max_length=max_seq_len,
-        sampling=False,
+        sampling=True,
         keep_first_n_tokens=1
     )
 
@@ -630,3 +675,70 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ============================================================================
+# Clustering / Embedding Metrics
+# ============================================================================
+
+def clustering_metrics(embeddings: np.ndarray, labels: np.ndarray, max_samples: int = 30000) -> Dict[str, float]:
+    """Compute Silhouette, Davies-Bouldin, Calinski-Harabasz on embeddings."""
+    if len(embeddings) > max_samples:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(len(embeddings), max_samples, replace=False)
+        embeddings = embeddings[idx]
+        labels = labels[idx]
+
+    n_labels = len(np.unique(labels))
+    if n_labels < 2:
+        return {"silhouette": float("nan"), "davies_bouldin": float("nan"), "calinski_harabasz": float("nan")}
+
+    return {
+        "silhouette": float(silhouette_score(embeddings, labels)),
+        "davies_bouldin": float(davies_bouldin_score(embeddings, labels)),
+        "calinski_harabasz": float(calinski_harabasz_score(embeddings, labels)),
+    }
+
+
+def embedding_stats(embeddings: np.ndarray, labels: np.ndarray) -> Dict[str, float]:
+    """Intra/inter-cluster distances and embedding spread."""
+    le = LabelEncoder()
+    label_ids = le.fit_transform(labels)
+
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)
+    emb = embeddings / norms
+
+    unique_labels = np.unique(label_ids)
+    centers = np.array([emb[label_ids == l].mean(axis=0) for l in unique_labels])
+
+    intra_dists = []
+    for l in unique_labels:
+        mask = label_ids == l
+        if mask.sum() > 1:
+            d = np.linalg.norm(emb[mask] - centers[l], axis=1).mean()
+            intra_dists.append(d)
+    intra = float(np.mean(intra_dists)) if intra_dists else float("nan")
+
+    if len(centers) > 1:
+        inter_dists = []
+        for i in range(len(centers)):
+            for j in range(i + 1, len(centers)):
+                inter_dists.append(np.linalg.norm(centers[i] - centers[j]))
+        inter = float(np.mean(inter_dists))
+    else:
+        inter = float("nan")
+
+    n_sample = min(5000, len(emb))
+    idx = np.random.default_rng(42).choice(len(emb), n_sample, replace=False)
+    sub = emb[idx]
+    sim = sub @ sub.T
+    mean_pairwise_cos = float(sim[np.triu_indices(n_sample, k=1)].mean())
+
+    return {
+        "intra_cluster_dist": intra,
+        "inter_cluster_dist": inter,
+        "inter_intra_ratio": inter / intra if intra > 0 else float("nan"),
+        "mean_pairwise_cosine": mean_pairwise_cos,
+        "global_std": float(np.std(emb)),
+    }

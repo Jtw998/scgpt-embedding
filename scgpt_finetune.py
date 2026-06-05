@@ -26,79 +26,20 @@ import numpy as np
 import scanpy as sc
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, SequentialSampler
 from tqdm import tqdm
 
 # Import reusable components from the local scgpt_embedding module
 from scgpt_embedding import (
     GeneVocab,
-    FullGeneDataset,
+    SparseGeneDataset,
     DataCollator,
     TransformerModel,
     load_scgpt_model,
     get_device,
+    simclr_loss,
+    RNAHead,
 )
-
-
-# ============================================================================
-# RNAHead — Mean-pool gene tokens then project
-# ============================================================================
-
-class RNAHead(nn.Module):
-    """RNA cell embedding head: mean pool gene tokens -> Linear projection.
-
-    Takes the full sequence output from scGPT (with CLS token at position 0),
-    mean-pools all gene tokens, and projects to the desired output dimension.
-    Does NOT apply L2 normalization.
-    """
-    def __init__(self, input_dim: int = 512, output_dim: int = 512):
-        super().__init__()
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.proj = nn.Linear(input_dim, output_dim)
-
-    def forward(self, sequence_output: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            sequence_output: (B, G+1, D) — scGPT output with CLS at position 0
-        Returns:
-            z_R: (B, output_dim) — cell embedding, NOT L2 normalized
-        """
-        # Mean pool all gene tokens (skip CLS at position 0)
-        gene_tokens = sequence_output[:, 1:, :]          # (B, G, D)
-        z_raw = gene_tokens.mean(dim=1)                   # (B, D)
-        return self.proj(z_raw)
-
-
-# ============================================================================
-# SimCLR InfoNCE Loss
-# ============================================================================
-
-def simclr_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float) -> torch.Tensor:
-    """SimCLR InfoNCE loss for two augmented views.
-
-    Args:
-        z1: (B, proj_dim) — projection of view 1
-        z2: (B, proj_dim) — projection of view 2
-        temperature: softmax temperature scaling factor
-
-    Returns:
-        Scalar cross-entropy loss treating (z1_i, z2_i) as positive pairs.
-    """
-    z1 = F.normalize(z1, dim=1)
-    z2 = F.normalize(z2, dim=1)
-    B = z1.shape[0]
-    z = torch.cat([z1, z2], dim=0)                        # (2B, proj_dim)
-    sim = z @ z.T / temperature                            # (2B, 2B)
-    sim_i_j = torch.diag(sim, B)                           # z1_i vs z2_i
-    sim_j_i = torch.diag(sim, -B)                          # z2_i vs z1_i
-    pos = torch.cat([sim_i_j, sim_j_i], dim=0).view(2 * B, 1)
-    mask = ~torch.eye(2 * B, device=z.device, dtype=torch.bool)
-    neg = sim[mask].view(2 * B, -1)
-    logits = torch.cat([pos, neg], dim=1)
-    labels = torch.zeros(2 * B, device=z.device, dtype=torch.long)
-    return F.cross_entropy(logits, labels)
 
 
 # ============================================================================
@@ -173,7 +114,7 @@ def scgpt_contrastive_train(
     model_configs = dict(model_configs)
     model_configs.setdefault("max_seq_len", max_seq_len)
 
-    dataset = FullGeneDataset(
+    dataset = SparseGeneDataset(
         count_matrix=count_matrix,
         gene_ids=gene_ids,
         vocab=vocab,
@@ -186,7 +127,7 @@ def scgpt_contrastive_train(
         pad_token_id=vocab["<pad>"],
         pad_value=model_configs.get("pad_value", 0),
         max_length=max_seq_len,
-        sampling=False,
+        sampling=True,
         keep_first_n_tokens=1,
     )
 
@@ -219,29 +160,32 @@ def scgpt_contrastive_train(
             gene_tokens = sequence_output[:, 1:, :]                  # (B, G, d_model)
             B, G, D = gene_tokens.shape
 
-            # Create two independent gene-dropout masks
-            n_keep = int((1.0 - dropout_rate) * G)
-            if n_keep < 1:
-                n_keep = 1
+            # Valid-gene mask: only real genes, not pad tokens
+            valid = (input_gene_ids[:, 1:] != vocab["<pad>"])       # (B, G)
+            n_valid = valid.sum(dim=1).float()                       # (B,)
+            n_keep_per = torch.clamp((n_valid * (1.0 - dropout_rate)).long(), min=1)  # (B,)
+            max_keep = int(n_keep_per.max().item())
 
-            def _make_mask(b: int, g: int, n: int) -> torch.Tensor:
-                """Create a binary mask keeping exactly n genes per row."""
-                idx = torch.stack([
-                    torch.randperm(g, device=device)[:n] for _ in range(b)
-                ], dim=0)                                           # (B, n_keep)
-                m = torch.zeros(b, g, device=device)
-                m.scatter_(1, idx, 1.0)
+            def _make_contrastive_mask():
+                scores = torch.rand(B, G, device=device)
+                scores.masked_fill_(~valid, -1.0)
+                _, idx = torch.topk(scores, max_keep, dim=1)          # (B, max_keep)
+                col_range = torch.arange(max_keep, device=device).unsqueeze(0)  # (1, max_keep)
+                row_mask = col_range < n_keep_per.unsqueeze(1)         # (B, max_keep)
+                flat_row = torch.arange(B, device=device).repeat_interleave(n_keep_per)
+                flat_col = idx[row_mask]
+                m = torch.zeros(B, G, device=device)
+                m[flat_row, flat_col] = 1.0
                 return m
 
-            mask1 = _make_mask(B, G, n_keep)
-            mask2 = _make_mask(B, G, n_keep)
+            mask1 = _make_contrastive_mask()
+            mask2 = _make_contrastive_mask()
 
-            # Apply masks before mean pooling
             masked1 = gene_tokens * mask1.unsqueeze(-1)             # (B, G, D)
             masked2 = gene_tokens * mask2.unsqueeze(-1)
 
-            z1 = masked1.sum(dim=1) / n_keep                        # (B, D)
-            z2 = masked2.sum(dim=1) / n_keep
+            z1 = masked1.sum(dim=1) / n_keep_per.unsqueeze(1)       # (B, D)
+            z2 = masked2.sum(dim=1) / n_keep_per.unsqueeze(1)
 
             h1 = proj_head(z1)                                      # (B, proj_dim)
             h2 = proj_head(z2)                                      # (B, proj_dim)
